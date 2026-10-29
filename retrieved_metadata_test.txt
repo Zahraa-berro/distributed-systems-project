@@ -1,0 +1,1 @@
+PostgreSQL metadata persistence test - 2026

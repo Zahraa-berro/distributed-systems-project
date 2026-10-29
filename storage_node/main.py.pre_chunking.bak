@@ -1,0 +1,52 @@
+import hashlib
+import os
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Request, Response
+
+app = FastAPI(title="Storage Node")
+NODE_ID = os.getenv("NODE_ID", "node-unknown")
+DATA_DIR = Path("/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "node_id": NODE_ID}
+
+@app.put("/chunks/{digest}")
+async def put_chunk(digest: str, request: Request):
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise HTTPException(400, "Invalid SHA-256 digest")
+    data = await request.body()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != digest:
+        raise HTTPException(400, "SHA-256 mismatch")
+    path = DATA_DIR / digest
+    if not path.exists():
+        temp = DATA_DIR / (digest + ".tmp")
+        temp.write_bytes(data)
+        temp.replace(path)
+    return {"node_id": NODE_ID, "sha256": digest, "size_bytes": len(data), "stored": True}
+
+@app.get("/chunks/{digest}")
+def get_chunk(digest: str):
+    path = DATA_DIR / digest
+    if not path.is_file():
+        raise HTTPException(404, "Chunk not found")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise HTTPException(500, "Stored chunk failed integrity check")
+    return Response(content=data, media_type="application/octet-stream")
+
+@app.head("/chunks/{digest}")
+def head_chunk(digest: str):
+    path = DATA_DIR / digest
+    if not path.is_file():
+        raise HTTPException(404, "Chunk not found")
+    return Response(status_code=200, headers={"Content-Length": str(path.stat().st_size)})
+
+@app.delete("/chunks/{digest}")
+def delete_chunk(digest: str):
+    path = DATA_DIR / digest
+    if path.exists():
+        path.unlink()
+    return {"node_id": NODE_ID, "deleted": digest}

@@ -1,0 +1,392 @@
+
+import hashlib
+import json
+import os
+import bisect
+from pathlib import Path
+from typing import Dict, List
+
+import httpx
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import Response
+
+app = FastAPI(title="Distributed Storage Gateway", version="0.2.0")
+
+NODE_URLS = [
+    x.strip().rstrip("/")
+    for x in os.getenv(
+        "NODE_URLS",
+        "http://node1:8001,http://node2:8001,"
+        "http://node3:8001,http://node4:8001",
+    ).split(",")
+    if x.strip()
+]
+
+if not NODE_URLS:
+    raise RuntimeError("At least one storage node must be configured")
+
+REPLICATION_FACTOR = min(
+    int(os.getenv("REPLICATION_FACTOR", "3")),
+    len(NODE_URLS),
+)
+VIRTUAL_NODES = int(os.getenv("VIRTUAL_NODES", "64"))
+
+if REPLICATION_FACTOR < 1 or VIRTUAL_NODES < 1:
+    raise RuntimeError("Replication factor and virtual nodes must be positive")
+
+META_FILE = Path("/app/metadata/objects.json")
+META_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_meta() -> Dict:
+    try:
+        return json.loads(META_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_meta(meta: Dict):
+    temp = META_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    temp.replace(META_FILE)
+
+
+# Consistent-hashing ring with virtual nodes.
+ring = []
+
+for node_url in NODE_URLS:
+    for vnode in range(VIRTUAL_NODES):
+        key = hashlib.sha256(
+            f"{node_url}#{vnode}".encode()
+        ).hexdigest()
+        ring.append((key, node_url))
+
+ring.sort()
+ring_keys = [entry[0] for entry in ring]
+
+
+def owners(object_key: str) -> List[str]:
+    """Return distinct storage nodes for a key on the hash ring."""
+    key_hash = hashlib.sha256(object_key.encode()).hexdigest()
+    start = bisect.bisect_left(ring_keys, key_hash)
+
+    result = []
+
+    for offset in range(len(ring)):
+        node = ring[(start + offset) % len(ring)][1]
+
+        if node not in result:
+            result.append(node)
+
+        if len(result) >= REPLICATION_FACTOR:
+            break
+
+    return result
+
+
+async def node_call(method: str, url: str, **kwargs):
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        return await client.request(method, url, **kwargs)
+
+
+def find_digest_references(meta: Dict, digest: str) -> List[Dict]:
+    """Find objects that reference the same content hash."""
+    return [
+        item
+        for item in meta.values()
+        if item.get("sha256") == digest
+    ]
+
+
+def collect_replicas(items: List[Dict]) -> List[str]:
+    """Collect unique node URLs recorded for these objects."""
+    result = []
+
+    for item in items:
+        for node in item.get("replicas", []):
+            if node not in result:
+                result.append(node)
+
+    return result
+
+
+async def verify_existing_replicas(
+    digest: str,
+    replicas: List[str],
+) -> List[str]:
+    """Reuse only replicas that return the expected content."""
+    valid = []
+
+    for node in replicas:
+        try:
+            response = await node_call(
+                "GET",
+                f"{node}/chunks/{digest}",
+            )
+
+            if (
+                response.status_code == 200
+                and hashlib.sha256(response.content).hexdigest() == digest
+            ):
+                valid.append(node)
+
+        except Exception:
+            continue
+
+    return valid
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "Distributed Storage Gateway",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+async def health():
+    statuses = {}
+
+    for node in NODE_URLS:
+        try:
+            response = await node_call("GET", f"{node}/health")
+            statuses[node] = (
+                response.json()
+                if response.status_code == 200
+                else {"status": "error", "code": response.status_code}
+            )
+        except Exception as exc:
+            statuses[node] = {
+                "status": "unreachable",
+                "detail": str(exc),
+            }
+
+    return {
+        "status": "ok",
+        "replication_factor": REPLICATION_FACTOR,
+        "nodes": statuses,
+    }
+
+
+@app.get("/cluster")
+def cluster():
+    return {
+        "nodes": NODE_URLS,
+        "node_count": len(NODE_URLS),
+        "replication_factor": REPLICATION_FACTOR,
+        "virtual_nodes_per_node": VIRTUAL_NODES,
+    }
+
+
+@app.post("/objects/{name}")
+async def put_object(name: str, file: UploadFile = File(...)):
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        raise HTTPException(
+            400,
+            "Use a simple object name without slashes.",
+        )
+
+    data = await file.read()
+    digest = hashlib.sha256(data).hexdigest()
+
+    meta = load_meta()
+    existing_items = find_digest_references(meta, digest)
+    previous_replicas = collect_replicas(existing_items)
+
+    # If this content already exists, verify its stored copies.
+    valid_existing = await verify_existing_replicas(
+        digest,
+        previous_replicas,
+    )
+
+    failures = {}
+
+    if len(valid_existing) >= min(2, REPLICATION_FACTOR):
+        # Reuse verified copies instead of uploading duplicate content.
+        successful_replicas = valid_existing
+        deduplicated = True
+
+    else:
+        # First upload, or recover if the existing copies are insufficient.
+        targets = owners(digest)
+        successful_replicas = []
+
+        for node in targets:
+            try:
+                response = await node_call(
+                    "PUT",
+                    f"{node}/chunks/{digest}",
+                    content=data,
+                    headers={"X-Content-SHA256": digest},
+                )
+
+                if response.status_code == 200:
+                    successful_replicas.append(node)
+                else:
+                    failures[node] = (
+                        f"HTTP {response.status_code}: {response.text}"
+                    )
+
+            except Exception as exc:
+                failures[node] = str(exc)
+
+        deduplicated = (
+            bool(existing_items)
+            and len(valid_existing) >= min(2, REPLICATION_FACTOR)
+        )
+
+    if len(successful_replicas) < min(2, REPLICATION_FACTOR):
+        raise HTTPException(
+            503,
+            {
+                "message": "Not enough valid replicas stored",
+                "replicas": successful_replicas,
+                "failures": failures,
+            },
+        )
+
+    meta[name] = {
+        "sha256": digest,
+        "size_bytes": len(data),
+        "content_type": (
+            file.content_type or "application/octet-stream"
+        ),
+        "replicas": successful_replicas,
+        "requested_replicas": owners(digest),
+    }
+
+    save_meta(meta)
+
+    return {
+        "name": name,
+        "sha256": digest,
+        "size_bytes": len(data),
+        "replicas": successful_replicas,
+        "deduplicated_by_content_hash": deduplicated,
+        "failures": failures,
+    }
+
+
+@app.get("/objects")
+def list_objects():
+    meta = load_meta()
+
+    return {
+        "count": len(meta),
+        "objects": [
+            {"name": name, **item}
+            for name, item in sorted(meta.items())
+        ],
+    }
+
+
+@app.get("/objects/{name}")
+async def get_object(name: str):
+    item = load_meta().get(name)
+
+    if not item:
+        raise HTTPException(404, "Object not found")
+
+    for node in item.get("replicas", []):
+        try:
+            response = await node_call(
+                "GET",
+                f"{node}/chunks/{item['sha256']}",
+            )
+
+            if response.status_code != 200:
+                continue
+
+            actual = hashlib.sha256(response.content).hexdigest()
+
+            if actual != item["sha256"]:
+                continue
+
+            return Response(
+                content=response.content,
+                media_type=item.get(
+                    "content_type",
+                    "application/octet-stream",
+                ),
+                headers={
+                    "X-Content-SHA256": actual,
+                    "Content-Disposition": (
+                        f'attachment; filename="{name}"'
+                    ),
+                },
+            )
+
+        except Exception:
+            continue
+
+    raise HTTPException(
+        503,
+        "No healthy, valid replica is available",
+    )
+
+
+@app.delete("/objects/{name}")
+async def delete_object(name: str):
+    meta = load_meta()
+    item = meta.get(name)
+
+    if not item:
+        raise HTTPException(404, "Object not found")
+
+    digest = item["sha256"]
+
+    # Capture every known location before removing this metadata entry.
+    all_replicas = collect_replicas(
+        find_digest_references(meta, digest)
+    )
+
+    del meta[name]
+
+    # Save metadata first. Never delete shared content while another
+    # object still references the same digest.
+    save_meta(meta)
+
+    remaining_references = find_digest_references(meta, digest)
+
+    if remaining_references:
+        return {
+            "deleted": name,
+            "content_removed": False,
+            "reason": "Content is still referenced by another object",
+            "remaining_references": len(remaining_references),
+        }
+
+    results = {}
+
+    for node in all_replicas:
+        try:
+            response = await node_call(
+                "DELETE",
+                f"{node}/chunks/{digest}",
+            )
+            results[node] = response.status_code
+
+        except Exception as exc:
+            results[node] = str(exc)
+
+    return {
+        "deleted": name,
+        "content_removed": True,
+        "replica_delete_results": results,
+    }
+
+
+@app.get("/objects/{name}/metadata")
+def object_metadata(name: str):
+    item = load_meta().get(name)
+
+    if not item:
+        raise HTTPException(404, "Object not found")
+
+    return {"name": name, **item}

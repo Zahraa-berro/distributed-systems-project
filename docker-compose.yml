@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: storage_metadata
+      POSTGRES_USER: storage_user
+      POSTGRES_PASSWORD: local_storage_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storage_user -d storage_metadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build: ./gateway
+    ports:
+      - "8001:8000"
+    environment:
+      DATABASE_URL: "postgresql://storage_user:local_storage_password@postgres:5432/storage_metadata"
+      NODE_URLS: "http://node1:8001,http://node2:8001,http://node3:8001,http://node4:8001"
+      REPLICATION_FACTOR: "3"
+      VIRTUAL_NODES: "64"
+    volumes:
+      - gateway_metadata:/app/metadata
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node1:
+        condition: service_started
+      node2:
+        condition: service_started
+      node3:
+        condition: service_started
+      node4:
+        condition: service_started
+
+  node1:
+    build: ./storage_node
+    environment:
+      NODE_ID: "node1"
+      GATEWAY_URL: "http://gateway:8000"
+    volumes:
+      - node1_data:/data
+    expose:
+      - "8001"
+
+  node2:
+    build: ./storage_node
+    environment:
+      NODE_ID: "node2"
+      GATEWAY_URL: "http://gateway:8000"
+    volumes:
+      - node2_data:/data
+    expose:
+      - "8001"
+
+  node3:
+    build: ./storage_node
+    environment:
+      NODE_ID: "node3"
+      GATEWAY_URL: "http://gateway:8000"
+    volumes:
+      - node3_data:/data
+    expose:
+      - "8001"
+
+  node4:
+    build: ./storage_node
+    environment:
+      NODE_ID: "node4"
+      GATEWAY_URL: "http://gateway:8000"
+    volumes:
+      - node4_data:/data
+    expose:
+      - "8001"
+
+volumes:
+  postgres_data:
+  gateway_metadata:
+  node1_data:
+  node2_data:
+  node3_data:
+  node4_data:
